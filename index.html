@@ -9,6 +9,8 @@
   <script src="https://cdn.tailwindcss.com"></script>
   <!-- Lucide Icons -->
   <script src="https://unpkg.com/lucide@latest"></script>
+  <!-- EXIF Library -->
+  <script src="https://cdn.jsdelivr.net/npm/exif-js"></script>
   <style>
     /* Custom Scrollbar and Animations */
     .hide-scrollbar::-webkit-scrollbar {
@@ -293,6 +295,36 @@
       reader.onerror = reject;
     });
 
+    const getExifData = (file) => new Promise((resolve) => {
+      if (!window.EXIF) return resolve(null);
+      EXIF.getData(file, function () {
+        const dateStr = EXIF.getTag(this, "DateTimeOriginal") || EXIF.getTag(this, "DateTime");
+        let timestamp = null;
+        if (dateStr) {
+          const parts = dateStr.split(" ");
+          if (parts.length === 2) {
+            timestamp = new Date(parts[0].replace(/:/g, "-") + "T" + parts[1]).getTime();
+          }
+        }
+
+        const lat = EXIF.getTag(this, "GPSLatitude");
+        const latRef = EXIF.getTag(this, "GPSLatitudeRef");
+        const lng = EXIF.getTag(this, "GPSLongitude");
+        const lngRef = EXIF.getTag(this, "GPSLongitudeRef");
+
+        let location = null;
+        if (lat && latRef && lng && lngRef) {
+          const convert = (dms, ref) => {
+            let deg = dms[0] + dms[1] / 60 + dms[2] / 3600;
+            if (ref === "S" || ref === "W") deg = -deg;
+            return deg;
+          };
+          location = { lat: convert(lat, latRef), lng: convert(lng, lngRef) };
+        }
+        resolve({ timestamp, location });
+      });
+    });
+
     const fetchWithRetry = async (url, options, retries = 3) => {
       for (let i = 0; i < retries; i++) {
         try {
@@ -421,6 +453,20 @@
       setActiveTab: (tab) => { state.activeTab = tab; updateUI(); },
       selectFlower: (id) => { state.selectedFlower = state.flowers.find(f => f.id === id); updateUI(); },
       closeModal: () => { state.selectedFlower = null; updateUI(); },
+      navigateToCategory: (tabId, categoryName) => {
+        const targetCategory = categoryName || "不明";
+        state.activeTab = tabId;
+        state.selectedFlower = null;
+        updateUI();
+        setTimeout(() => {
+          const el = document.getElementById(`group-${targetCategory}`);
+          if (el) {
+            el.scrollIntoView({ behavior: 'smooth' });
+            el.classList.add('bg-emerald-50/50', 'rounded-3xl');
+            setTimeout(() => el.classList.remove('bg-emerald-50/50', 'rounded-3xl'), 2000);
+          }
+        }, 150);
+      },
       triggerCamera: () => { document.getElementById('camera-input').click(); },
       dismissToast: (type) => {
         if (type === 'error') state.errorMsg = '';
@@ -436,13 +482,21 @@
 
         state.isCapturing = true; state.errorMsg = ''; updateUI();
         try {
+          state.loadingMsg = '写真の情報を読み取っています...'; updateUI();
+          const exif = await getExifData(file);
+
           state.loadingMsg = '画像を最適化しています...'; updateUI();
           const { base64String, mimeType, fullDataUrl } = await resizeImage(file);
           if (base64String.length * 0.75 > 1024 * 1024 * 1.3) throw new Error("最適化後も画像サイズが大きすぎます。");
 
           state.loadingMsg = '撮影場所を取得しています...'; updateUI();
-          const location = await getLocation() || {};
-          if (location.lat) location.address = await getAddress(location.lat, location.lng);
+          let location = exif?.location;
+          if (!location) {
+            location = await getLocation() || {};
+          }
+          if (location.lat && !location.address) {
+            location.address = await getAddress(location.lat, location.lng);
+          }
 
           state.loadingMsg = 'AIが花を調べています...'; updateUI();
           const prompt = `この画像に写っている花の種類を特定し、必ず以下のJSON形式でのみ情報を出力してください。他の説明や挨拶は一切不要です。\n{ "name": "一般的な花の名前（日本語）", "yomi": "はなのなまえ（ひらがなで）", "season": "春, 夏, 秋, 冬 のいずれか", "family": "植物の分類（例：バラ科）", "description": "花の特徴や豆知識などの短い説明（2〜3文程度）" }`;
@@ -451,7 +505,8 @@
 
           const newId = Date.now().toString();
           const newFlower = {
-            id: newId, imageUrl: fullDataUrl, date: Date.now(),
+            id: newId, imageUrl: fullDataUrl,
+            date: exif?.timestamp || Date.now(),
             name: aiResult.name || "不明な花", yomi: aiResult.yomi || "ふめい",
             season: aiResult.season || "不明", family: aiResult.family || "不明",
             description: aiResult.description || "説明はありません。", location
@@ -882,7 +937,7 @@
           const keys = Object.keys(groups).sort((a, b) => orderMap[state.activeTab] ? orderMap[state.activeTab].indexOf(a) - orderMap[state.activeTab].indexOf(b) : a.localeCompare(b));
 
           main.innerHTML = `<div class="space-y-10 pb-24">${keys.map(k => `
-            <div>
+            <div id="group-${k}" class="scroll-mt-32 transition-all duration-500">
               <h3 class="text-sm font-black text-emerald-700/50 uppercase tracking-widest mb-4 flex items-center gap-2"><span class="h-px bg-emerald-100 flex-1"></span>${k} (${groups[k].length})<span class="h-px bg-emerald-100 flex-1"></span></h3>
               <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">${groups[k].map(renderCard).join('')}</div>
             </div>`).join('')}</div>`;
@@ -915,8 +970,8 @@
                 <div class="pt-16 px-8 sm:px-10 overflow-y-auto pb-32 h-full">
                     <div class="mb-8"><span class="inline-block px-3 py-1 bg-emerald-50 text-emerald-600 text-[10px] font-black rounded-full mb-2 tracking-widest uppercase">${f.yomi}</span><h2 class="text-4xl font-black text-stone-800 tracking-tight leading-none">${f.name}</h2></div>
                     <div class="grid grid-cols-2 gap-4 mb-8">
-                      <div class="bg-stone-50 border border-stone-100 rounded-2xl p-4 flex flex-col items-center text-center"><div class="text-emerald-500 mb-1"><i data-lucide="calendar" class="w-4 h-4"></i></div><div class="text-[9px] font-black text-stone-300 uppercase tracking-widest mb-0.5">見ごろ</div><div class="font-bold text-stone-800 text-sm">${f.season}</div></div>
-                      <div class="bg-stone-50 border border-stone-100 rounded-2xl p-4 flex flex-col items-center text-center"><div class="text-emerald-500 mb-1"><i data-lucide="leaf" class="w-4 h-4"></i></div><div class="text-[9px] font-black text-stone-300 uppercase tracking-widest mb-0.5">分類</div><div class="font-bold text-stone-800 text-sm">${f.family}</div></div>
+                      <div onclick="window.app.navigateToCategory('season', '${f.season}')" class="cursor-pointer hover:bg-stone-100 hover:scale-[1.02] active:scale-[0.98] transition-all bg-stone-50 border border-stone-100 rounded-2xl p-4 flex flex-col items-center text-center group/item"><div class="text-emerald-500 mb-1 group-hover/item:scale-110 transition-transform"><i data-lucide="calendar" class="w-4 h-4"></i></div><div class="text-[9px] font-black text-stone-300 uppercase tracking-widest mb-0.5">見ごろ</div><div class="font-bold text-stone-800 text-sm">${f.season}</div></div>
+                      <div onclick="window.app.navigateToCategory('family', '${f.family}')" class="cursor-pointer hover:bg-stone-100 hover:scale-[1.02] active:scale-[0.98] transition-all bg-stone-50 border border-stone-100 rounded-2xl p-4 flex flex-col items-center text-center group/item"><div class="text-emerald-500 mb-1 group-hover/item:scale-110 transition-transform"><i data-lucide="leaf" class="w-4 h-4"></i></div><div class="text-[9px] font-black text-stone-300 uppercase tracking-widest mb-0.5">分類</div><div class="font-bold text-stone-800 text-sm">${f.family}</div></div>
                     </div>
                     <div class="mb-8"><h4 class="text-xs font-black text-stone-400 mb-3 flex items-center gap-2 uppercase tracking-widest"><i data-lucide="info" class="w-3.5 h-3.5"></i> Description</h4><p class="text-stone-600 text-base leading-relaxed font-medium">${f.description}</p></div>
                     ${f.location ? `<div class="bg-stone-100/50 border border-stone-200/50 rounded-2xl p-5 mb-8"><h4 class="text-xs font-black text-stone-400 mb-2 uppercase tracking-widest flex items-center gap-2"><i data-lucide="map-pin" class="w-3.5 h-3.5"></i> Spotted at</h4><p class="text-stone-700 font-bold text-lg">${f.location.address || '場所情報なし'}</p></div>` : ''}
